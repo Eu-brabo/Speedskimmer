@@ -1,0 +1,5 @@
+{
+  "name": "RapidReader RSVP",
+  "description": "A high-performance Rapid Serial Visual Presentation (RSVP) reader that allows users to upload PDFs and read them one word at a time at high speeds, featuring an optimal recognition point highlight.",
+  "requestFramePermissions": []
+}
