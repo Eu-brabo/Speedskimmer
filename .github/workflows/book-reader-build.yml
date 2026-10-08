@@ -1,0 +1,593 @@
+name: Build Book Reader APK
+
+on:
+  push:
+    branches: [book-reader-build]
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout build branch
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Clone tested Kokoro Android runtime
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/kokoro-android
+          git clone --depth 1 https://github.com/ffmpegkit-maintained/kokoro-android.git /tmp/kokoro-android
+          cp -a /tmp/kokoro-android/. .
+          rm -rf /tmp/kokoro-android
+
+      - name: Add PDF dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("sample/build.gradle.kts")
+          s = p.read_text()
+          needle = 'implementation(libs.kotlinx.coroutines.android)'
+          s = s.replace(needle, needle + '\n    implementation("com.tom-roush:pdfbox-android:2.0.27.0")')
+          p.write_text(s)
+          PY
+
+      - name: Replace sample with Book Reader
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("sample/src/main/AndroidManifest.xml")
+          s = p.read_text()
+          s = s.replace('<manifest xmlns:android="http://schemas.android.com/apk/res/android">',
+                        '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                        '    <uses-permission android:name="android.permission.INTERNET" />\n'
+                        '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n'
+                        '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />\n'
+                        '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />')
+          s = s.replace('</application>',
+                        '        <service android:name=".ReaderService" android:exported="false" android:foregroundServiceType="mediaPlayback" />\n'
+                        '    </application>')
+          s = s.replace('android:label="Kokoro TTS Sample"', 'android:label="Book Reader"')
+          p.write_text(s)
+          PY
+
+          cat > sample/src/main/kotlin/dev/ffmpegkit/kokoro/sample/MainActivity.kt <<'EOF'
+          package dev.ffmpegkit.kokoro.sample
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.core.app.ActivityCompat
+          import androidx.core.content.ContextCompat
+          import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+          import com.tom_roush.pdfbox.pdmodel.PDDocument
+          import com.tom_roush.pdfbox.text.PDFTextStripper
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.concurrent.Executors
+
+          class MainActivity : Activity() {
+              companion object {
+                  private const val PICK_PDF = 100
+                  private const val NOTIFICATION_REQUEST = 101
+                  private const val MODEL_NAME = "kokoro.onnx"
+                  private const val MODEL_MIN_BYTES = 300_000_000L
+                  private const val MODEL_URL =
+                      "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model.onnx?download=true"
+              }
+
+              private val executor = Executors.newSingleThreadExecutor()
+              private lateinit var status: TextView
+              private lateinit var preview: TextView
+              private lateinit var progress: ProgressBar
+              private lateinit var modelButton: Button
+              private lateinit var openButton: Button
+              private lateinit var readButton: Button
+
+              private var bookText = ""
+              private var bookName = "Book"
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  PDFBoxResourceLoader.init(applicationContext)
+                  buildUi()
+                  updateState()
+                  requestNotificationPermission()
+              }
+
+              private fun buildUi() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(18), dp(18), dp(18), dp(18))
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "BOOK READER"
+                      textSize = 24f
+                      gravity = Gravity.CENTER
+                  }
+                  root.addView(title, LinearLayout.LayoutParams(-1, -2))
+
+                  modelButton = Button(this).apply {
+                      setOnClickListener { downloadModel() }
+                  }
+                  root.addView(modelButton, LinearLayout.LayoutParams(-1, -2))
+
+                  progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                      max = 100
+                      progress = 0
+                  }
+                  root.addView(progress, LinearLayout.LayoutParams(-1, dp(8)))
+
+                  openButton = Button(this).apply {
+                      text = "OPEN PDF"
+                      setOnClickListener { pickPdf() }
+                  }
+                  root.addView(openButton, LinearLayout.LayoutParams(-1, -2))
+
+                  status = TextView(this).apply {
+                      textSize = 15f
+                  }
+                  root.addView(status, LinearLayout.LayoutParams(-1, -2))
+
+                  preview = TextView(this).apply {
+                      textSize = 15f
+                      setPadding(0, dp(8), 0, dp(8))
+                      setTextIsSelectable(true)
+                  }
+                  root.addView(preview, LinearLayout.LayoutParams(-1, 0, 1f))
+
+                  readButton = Button(this).apply {
+                      text = "▶ READ"
+                      setOnClickListener { startReader() }
+                  }
+                  root.addView(readButton, LinearLayout.LayoutParams(-1, -2))
+
+                  val stopButton = Button(this).apply {
+                      text = "■ STOP"
+                      setOnClickListener { stopReader() }
+                  }
+                  root.addView(stopButton, LinearLayout.LayoutParams(-1, -2))
+
+                  setContentView(root)
+              }
+
+              private fun modelFile() = File(filesDir, MODEL_NAME)
+
+              private fun updateState() {
+                  val ready = modelFile().exists() && modelFile().length() >= MODEL_MIN_BYTES
+                  modelButton.text = if (ready) "VOICE MODEL INSTALLED" else "DOWNLOAD KOKORO VOICE (~326 MB)"
+                  modelButton.isEnabled = !ready
+                  openButton.isEnabled = ready
+                  readButton.isEnabled = ready && bookText.isNotBlank()
+                  status.text = if (ready) "Kokoro is ready. Open a PDF." else "One-time download; speech runs locally afterward."
+              }
+
+              private fun downloadModel() {
+                  modelButton.isEnabled = false
+                  progress.progress = 0
+                  status.text = "Downloading Kokoro…"
+                  executor.execute {
+                      val temp = File(filesDir, "kokoro.onnx.part")
+                      try {
+                          downloadFile(temp)
+                          require(temp.length() >= MODEL_MIN_BYTES) { "Incomplete model download." }
+                          val target = modelFile()
+                          if (target.exists()) target.delete()
+                          require(temp.renameTo(target)) { "Could not install model file." }
+                          runOnUiThread {
+                              progress.progress = 100
+                              updateState()
+                              Toast.makeText(this, "Kokoro installed.", Toast.LENGTH_SHORT).show()
+                          }
+                      } catch (t: Throwable) {
+                          temp.delete()
+                          runOnUiThread {
+                              modelButton.isEnabled = true
+                              status.text = "Download failed: " + (t.message ?: "unknown error")
+                              Toast.makeText(this, "Voice model download failed.", Toast.LENGTH_LONG).show()
+                          }
+                      }
+                  }
+              }
+
+              private fun downloadFile(target: File) {
+                  val connection = (URL(MODEL_URL).openConnection() as HttpURLConnection).apply {
+                      connectTimeout = 30_000
+                      readTimeout = 120_000
+                      instanceFollowRedirects = true
+                  }
+                  try {
+                      connection.connect()
+                      require(connection.responseCode in 200..299) { "HTTP " + connection.responseCode }
+                      val total = connection.contentLengthLong
+                      connection.inputStream.use { input ->
+                          target.outputStream().use { output ->
+                              val buffer = ByteArray(1024 * 1024)
+                              var done = 0L
+                              var last = -1
+                              while (true) {
+                                  val n = input.read(buffer)
+                                  if (n < 0) break
+                                  output.write(buffer, 0, n)
+                                  done += n
+                                  if (total > 0) {
+                                      val pct = ((done * 100) / total).toInt().coerceIn(0, 100)
+                                      if (pct != last) {
+                                          last = pct
+                                          runOnUiThread { progress.progress = pct }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  } finally {
+                      connection.disconnect()
+                  }
+              }
+
+              private fun pickPdf() {
+                  val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                      addCategory(Intent.CATEGORY_OPENABLE)
+                      type = "application/pdf"
+                      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                      addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                  }
+                  startActivityForResult(intent, PICK_PDF)
+              }
+
+              @Deprecated("Compatibility callback for API 24+.")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != PICK_PDF || resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+
+                  try {
+                      val flags = data.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+                      contentResolver.takePersistableUriPermission(uri, flags)
+                  } catch (_: Throwable) {
+                  }
+
+                  bookName = uri.lastPathSegment?.substringAfterLast('/') ?: "Book"
+                  status.text = "Extracting PDF text…"
+                  preview.text = ""
+                  readButton.isEnabled = false
+
+                  executor.execute {
+                      try {
+                          val extracted = contentResolver.openInputStream(uri).use { input ->
+                              requireNotNull(input)
+                              PDDocument.load(input).use { document ->
+                                  PDFTextStripper().apply { sortByPosition = true }.getText(document)
+                              }
+                          }.cleanText()
+
+                          bookText = extracted
+                          runOnUiThread {
+                              if (extracted.isBlank()) {
+                                  status.text = "No selectable text. This appears to be a scanned/image PDF."
+                                  preview.text = ""
+                                  readButton.isEnabled = false
+                              } else {
+                                  status.text = "Ready: " + extracted.length + " characters"
+                                  preview.text = extracted.take(5000) + if (extracted.length > 5000) "\n\n…" else ""
+                                  readButton.isEnabled = true
+                              }
+                          }
+                      } catch (t: Throwable) {
+                          bookText = ""
+                          runOnUiThread {
+                              status.text = "PDF error: " + (t.message ?: "unknown error")
+                          }
+                      }
+                  }
+              }
+
+              private fun startReader() {
+                  if (bookText.isBlank()) return
+                  val intent = Intent(this, ReaderService::class.java).apply {
+                      action = ReaderService.ACTION_START
+                      putExtra(ReaderService.EXTRA_TEXT, bookText)
+                      putExtra(ReaderService.EXTRA_BOOK_NAME, bookName)
+                  }
+                  if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent) else startService(intent)
+                  status.text = "Reading with Kokoro…"
+              }
+
+              private fun stopReader() {
+                  startService(Intent(this, ReaderService::class.java).setAction(ReaderService.ACTION_STOP))
+                  status.text = "Stopped."
+              }
+
+              private fun requestNotificationPermission() {
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                      ActivityCompat.requestPermissions(
+                          this,
+                          arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                          NOTIFICATION_REQUEST
+                      )
+                  }
+              }
+
+              private fun String.cleanText(): String =
+                  replace('\u0000', ' ')
+                      .replace(Regex("(?m)-\\n"), "")
+                      .replace(Regex("(?m)(?<!-)\\n(?=\\p{Ll})"), "")
+                      .replace(Regex("[ \\t]+"), " ")
+                      .replace(Regex("\\n{3,}"), "\\n\\n")
+                      .trim()
+
+              private fun dp(value: Int): Int =
+                  (value * resources.displayMetrics.density).toInt()
+
+              override fun onDestroy() {
+                  executor.shutdownNow()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+          cat > sample/src/main/kotlin/dev/ffmpegkit/kokoro/sample/ReaderService.kt <<'EOF'
+          package dev.ffmpegkit.kokoro.sample
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioTrack
+          import android.os.Build
+          import android.os.IBinder
+          import dev.ffmpegkit.kokoro.KokoroConfig
+          import dev.ffmpegkit.kokoro.KokoroTTS
+          import dev.ffmpegkit.kokoro.KokoroVoice
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.cancel
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import java.io.File
+          import java.util.concurrent.atomic.AtomicBoolean
+
+          class ReaderService : Service() {
+              companion object {
+                  const val ACTION_START = "BOOK_READER_START"
+                  const val ACTION_STOP = "BOOK_READER_STOP"
+                  const val EXTRA_TEXT = "text"
+                  const val EXTRA_BOOK_NAME = "bookName"
+                  private const val CHANNEL = "book_reader_playback"
+                  private const val NOTIFICATION = 7
+                  private const val MAX_CHUNK = 900
+              }
+
+              private val job = SupervisorJob()
+              private val scope = CoroutineScope(Dispatchers.Default + job)
+              private val stopped = AtomicBoolean(false)
+              private var readJob: kotlinx.coroutines.Job? = null
+              private var currentBook = "Book"
+
+              override fun onCreate() {
+                  super.onCreate()
+                  createChannel()
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_STOP -> stopReader()
+                      ACTION_START -> {
+                          val text = intent.getStringExtra(EXTRA_TEXT).orEmpty()
+                          if (text.isBlank()) {
+                              stopSelf()
+                              return START_NOT_STICKY
+                          }
+                          currentBook = intent.getStringExtra(EXTRA_BOOK_NAME).orEmpty().ifBlank { "Book" }
+                          readJob?.cancel()
+                          stopped.set(false)
+                          startForeground(NOTIFICATION, notification("Preparing…"))
+                          readJob = scope.launch { readBook(text) }
+                      }
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private suspend fun readBook(text: String) {
+                  val model = File(filesDir, "kokoro.onnx")
+                  if (!model.exists()) {
+                      stopReader()
+                      return
+                  }
+
+                  try {
+                      val chunks = splitText(text)
+                      KokoroTTS.initialize(this@ReaderService, model.absolutePath, KokoroVoice.AF_HEART)
+
+                      for (i in chunks.indices) {
+                          if (stopped.get()) break
+
+                          updateNotification("Reading " + (i + 1) + "/" + chunks.size)
+                          val result = KokoroTTS.speak(
+                              chunks[i],
+                              KokoroConfig(speed = 1.0f, sampleRate = 24_000)
+                          )
+                          if (stopped.get()) break
+                          playWav(result.audioData, result.sampleRate)
+                      }
+                  } catch (_: Throwable) {
+                      // Stop cleanly on inference/model/audio errors.
+                  } finally {
+                      KokoroTTS.release()
+                      if (!stopped.get()) stopReader()
+                  }
+              }
+
+              private suspend fun playWav(wav: ByteArray, sampleRate: Int) {
+                  if (wav.size <= 44) return
+                  val pcm = wav.copyOfRange(44, wav.size)
+
+                  val track = AudioTrack.Builder()
+                      .setAudioAttributes(
+                          AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_MEDIA)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                              .build()
+                      )
+                      .setAudioFormat(
+                          AudioFormat.Builder()
+                              .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                              .setSampleRate(sampleRate)
+                              .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                              .build()
+                      )
+                      .setTransferMode(AudioTrack.MODE_STATIC)
+                      .setBufferSizeInBytes(pcm.size.coerceAtLeast(8192))
+                      .build()
+
+                  try {
+                      track.write(pcm, 0, pcm.size)
+                      track.play()
+                      while (!stopped.get() &&
+                          track.playbackState == AudioTrack.PLAYSTATE_PLAYING &&
+                          track.playbackHeadPosition < pcm.size / 2) {
+                          delay(100)
+                      }
+                  } finally {
+                      runCatching { track.stop() }
+                      track.release()
+                  }
+              }
+
+              private fun splitText(text: String): List<String> {
+                  val clean = text.replace(Regex("\\s+"), " ").trim()
+                  val result = mutableListOf<String>()
+                  var start = 0
+
+                  while (start < clean.length) {
+                      var end = minOf(start + MAX_CHUNK, clean.length)
+                      if (end < clean.length) {
+                          val punctuation = clean.lastIndexOfAny(
+                              charArrayOf('.', '!', '?', ';', ':', ','),
+                              end - 1
+                          )
+                          if (punctuation > start + 300) {
+                              end = punctuation + 1
+                          } else {
+                              val space = clean.lastIndexOf(' ', end - 1)
+                              if (space > start + 200) end = space
+                          }
+                      }
+                      result.add(clean.substring(start, end).trim())
+                      start = end
+                  }
+
+                  return result.filter { it.isNotBlank() }
+              }
+
+              private fun createChannel() {
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      getSystemService(NotificationManager::class.java).createNotificationChannel(
+                          NotificationChannel(
+                              CHANNEL,
+                              "Book playback",
+                              NotificationManager.IMPORTANCE_LOW
+                          )
+                      )
+                  }
+              }
+
+              private fun notification(message: String): Notification {
+                  val pending = PendingIntent.getActivity(
+                      this,
+                      0,
+                      Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+
+                  val builder = if (Build.VERSION.SDK_INT >= 26) {
+                      Notification.Builder(this, CHANNEL)
+                  } else {
+                      Notification.Builder(this)
+                  }
+
+                  return builder
+                      .setContentTitle("Book Reader")
+                      .setContentText(currentBook + " — " + message)
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .setContentIntent(pending)
+                      .setOngoing(true)
+                      .setOnlyAlertOnce(true)
+                      .build()
+              }
+
+              private fun updateNotification(message: String) {
+                  getSystemService(NotificationManager::class.java)
+                      .notify(NOTIFICATION, notification(message))
+              }
+
+              private fun stopReader() {
+                  stopped.set(true)
+                  readJob?.cancel()
+                  runCatching { KokoroTTS.release() }
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
+              }
+
+              override fun onDestroy() {
+                  stopped.set(true)
+                  readJob?.cancel()
+                  runCatching { KokoroTTS.release() }
+                  scope.cancel()
+                  super.onDestroy()
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+          }
+          EOF
+
+      - name: Build debug APK
+        run: |
+          set -euo pipefail
+          ./gradlew :sample:assembleDebug --stacktrace
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          APK="sample/build/outputs/apk/debug/sample-debug.apk"
+          test -f "$APK"
+          test "$(stat -c%s "$APK")" -gt 1000000
+          sha256sum "$APK"
+          ls -lh "$APK"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: BookReader-Android14-Kokoro
+          path: sample/build/outputs/apk/debug/sample-debug.apk
+          if-no-files-found: error
