@@ -24,7 +24,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf /tmp/kokoro-android
-          git clone --depth 1 https://github.com/ffmpegkit-maintained/kokoro-android.git /tmp/kokoro-android
+          git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/ffmpegkit-maintained/kokoro-android.git /tmp/kokoro-android
           cp -a /tmp/kokoro-android/. .
           rm -rf /tmp/kokoro-android
 
