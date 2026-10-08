@@ -94,9 +94,9 @@ jobs:
                   private const val PICK_PDF = 100
                   private const val NOTIFICATION_REQUEST = 101
                   private const val MODEL_NAME = "kokoro.onnx"
-                  private const val MODEL_MIN_BYTES = 300_000_000L
+                  private const val MODEL_MIN_BYTES = 80_000_000L
                   private const val MODEL_URL =
-                      "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model.onnx?download=true"
+                      "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_quantized.onnx?download=true"
               }
 
               private val executor = Executors.newSingleThreadExecutor()
@@ -179,7 +179,7 @@ jobs:
 
               private fun updateState() {
                   val ready = modelFile().exists() && modelFile().length() >= MODEL_MIN_BYTES
-                  modelButton.text = if (ready) "VOICE MODEL INSTALLED" else "DOWNLOAD KOKORO VOICE (~326 MB)"
+                  modelButton.text = if (ready) "VOICE MODEL INSTALLED" else "DOWNLOAD KOKORO VOICE (~92 MB)"
                   modelButton.isEnabled = !ready
                   openButton.isEnabled = ready
                   readButton.isEnabled = ready && bookText.isNotBlank()
@@ -292,7 +292,7 @@ jobs:
                                   preview.text = ""
                                   readButton.isEnabled = false
                               } else {
-                                  status.text = "Ready: " + extracted.length + " characters"
+                                  status.text = "Ready: " + extracted.length + " characters. Tap READ."
                                   preview.text = extracted.take(5000) + if (extracted.length > 5000) "\n\n…" else ""
                                   readButton.isEnabled = true
                               }
@@ -310,7 +310,10 @@ jobs:
                   if (bookText.isBlank()) return
                   val intent = Intent(this, ReaderService::class.java).apply {
                       action = ReaderService.ACTION_START
-                      putExtra(ReaderService.EXTRA_TEXT, bookText)
+                      val bookFile = File(filesDir, "current_book.txt")
+                  bookFile.writeText(bookText, Charsets.UTF_8)
+                  bookText = ""
+                  putExtra(ReaderService.EXTRA_BOOK_PATH, bookFile.absolutePath)
                       putExtra(ReaderService.EXTRA_BOOK_NAME, bookName)
                   }
                   if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent) else startService(intent)
@@ -381,8 +384,9 @@ jobs:
               companion object {
                   const val ACTION_START = "BOOK_READER_START"
                   const val ACTION_STOP = "BOOK_READER_STOP"
-                  const val EXTRA_TEXT = "text"
+                  const val EXTRA_BOOK_PATH = "bookPath"
                   const val EXTRA_BOOK_NAME = "bookName"
+                  const val EXTRA_BOOK_PATH = "bookPath"
                   private const val CHANNEL = "book_reader_playback"
                   private const val NOTIFICATION = 7
                   private const val MAX_CHUNK = 900
@@ -403,8 +407,8 @@ jobs:
                   when (intent?.action) {
                       ACTION_STOP -> stopReader()
                       ACTION_START -> {
-                          val text = intent.getStringExtra(EXTRA_TEXT).orEmpty()
-                          if (text.isBlank()) {
+                          val path = intent.getStringExtra(EXTRA_BOOK_PATH).orEmpty()
+                          if (path.isBlank()) {
                               stopSelf()
                               return START_NOT_STICKY
                           }
@@ -412,14 +416,20 @@ jobs:
                           readJob?.cancel()
                           stopped.set(false)
                           startForeground(NOTIFICATION, notification("Preparing…"))
-                          readJob = scope.launch { readBook(text) }
+                          readJob = scope.launch { readBookFromFile(path) }
                       }
                   }
                   return START_NOT_STICKY
               }
 
-              private suspend fun readBook(text: String) {
+              private suspend fun readBookFromFile(path: String) {
                   val model = File(filesDir, "kokoro.onnx")
+                  val bookFile = File(path)
+                  if (!bookFile.exists()) {
+                      stopReader()
+                      return
+                  }
+                  val text = bookFile.readText(Charsets.UTF_8)
                   if (!model.exists()) {
                       stopReader()
                       return
@@ -440,8 +450,8 @@ jobs:
                           if (stopped.get()) break
                           playWav(result.audioData, result.sampleRate)
                       }
-                  } catch (_: Throwable) {
-                      // Stop cleanly on inference/model/audio errors.
+                  } catch (t: Throwable) {
+                      updateNotification("Playback error — open the app for details")
                   } finally {
                       KokoroTTS.release()
                       if (!stopped.get()) stopReader()
@@ -466,18 +476,23 @@ jobs:
                               .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                               .build()
                       )
-                      .setTransferMode(AudioTrack.MODE_STATIC)
-                      .setBufferSizeInBytes(pcm.size.coerceAtLeast(8192))
+                      .setTransferMode(AudioTrack.MODE_STREAM)
+                      .setBufferSizeInBytes(AudioTrack.getMinBufferSize(
+                          sampleRate,
+                          AudioFormat.CHANNEL_OUT_MONO,
+                          AudioFormat.ENCODING_PCM_16BIT
+                      ).coerceAtLeast(8192))
                       .build()
 
                   try {
-                      track.write(pcm, 0, pcm.size)
                       track.play()
-                      while (!stopped.get() &&
-                          track.playState == AudioTrack.PLAYSTATE_PLAYING &&
-                          track.playbackHeadPosition < pcm.size / 2) {
-                          delay(100)
+                      var offset = 0
+                      while (!stopped.get() && offset < pcm.size) {
+                          val written = track.write(pcm, offset, pcm.size - offset, AudioTrack.WRITE_BLOCKING)
+                          if (written < 0) break
+                          offset += written
                       }
+                      track.stop()
                   } finally {
                       runCatching { track.stop() }
                       track.release()
