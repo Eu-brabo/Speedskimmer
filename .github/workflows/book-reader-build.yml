@@ -474,7 +474,7 @@ jobs:
                       track.write(pcm, 0, pcm.size)
                       track.play()
                       while (!stopped.get() &&
-                          track.playbackState == AudioTrack.PLAYSTATE_PLAYING &&
+                          track.playState == AudioTrack.PLAYSTATE_PLAYING &&
                           track.playbackHeadPosition < pcm.size / 2) {
                           delay(100)
                       }
