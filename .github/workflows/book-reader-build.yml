@@ -574,7 +574,7 @@ jobs:
       - name: Build debug APK
         run: |
           set -euo pipefail
-          ./gradlew :sample:assembleDebug --stacktrace
+          bash ./gradlew :sample:assembleDebug --stacktrace
 
       - name: Verify APK
         run: |
