@@ -386,7 +386,6 @@ jobs:
                   const val ACTION_STOP = "BOOK_READER_STOP"
                   const val EXTRA_BOOK_PATH = "bookPath"
                   const val EXTRA_BOOK_NAME = "bookName"
-                  const val EXTRA_BOOK_PATH = "bookPath"
                   private const val CHANNEL = "book_reader_playback"
                   private const val NOTIFICATION = 7
                   private const val MAX_CHUNK = 900
