@@ -93,7 +93,7 @@ jobs:
               companion object {
                   private const val PICK_PDF = 100
                   private const val NOTIFICATION_REQUEST = 101
-                  private const val MODEL_NAME = "kokoro.onnx"
+                  private const val MODEL_NAME = "kokoro_mobile.onnx"
                   private const val MODEL_MIN_BYTES = 80_000_000L
                   private const val MODEL_URL =
                       "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_quantized.onnx?download=true"
@@ -423,7 +423,7 @@ jobs:
               }
 
               private suspend fun readBookFromFile(path: String) {
-                  val model = File(filesDir, "kokoro.onnx")
+                  val model = File(filesDir, "kokoro_mobile.onnx")
                   val bookFile = File(path)
                   if (!bookFile.exists()) {
                       stopReader()
