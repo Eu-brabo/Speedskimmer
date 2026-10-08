@@ -28,6 +28,27 @@ jobs:
           cp -a /tmp/kokoro-android/. .
           rm -rf /tmp/kokoro-android
 
+      - name: Use published Kokoro AAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("settings.gradle.kts")
+          s = p.read_text()
+          s = s.replace('include(":library")\n', '')
+          p.write_text(s)
+
+          p = Path("sample/build.gradle.kts")
+          s = p.read_text()
+          s = s.replace(
+              'implementation(project(":library"))',
+              'implementation("dev.ffmpegkit-maintained:kokoro-android:0.1.0")'
+          )
+          p.write_text(s)
+          PY
+
       - name: Add PDF dependency
         shell: bash
         run: |
